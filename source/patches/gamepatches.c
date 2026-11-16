@@ -91,6 +91,21 @@ void RegisterDOL(u8 *dst, int len)
     dolCount++;
 }
 
+int GetDOLChunkCount()
+{
+    return dolCount;
+}
+
+void GetDOLChunk(int index, u8 **dst, int *len)
+{
+    *dst = NULL;
+    *len = 0;
+    if (index < 0 || index >= dolCount)
+        return;
+    *dst = dolList[index].dst;
+    *len = dolList[index].len;
+}
+
 void ClearDOLList()
 {
     if (dolList)

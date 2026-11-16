@@ -13,6 +13,7 @@ typedef struct _GameCFG
 	short video;
 	short videoPatchDol;
 	short patchFix480p;
+	short gcAdapter;
 	short deflicker;
 	short aspectratio;
 	short ScreenMode;
@@ -87,6 +88,7 @@ typedef struct _GameCFG
 		this->videoPatchDol = game.videoPatchDol;
 		this->deflicker = game.deflicker;
 		this->patchFix480p = game.patchFix480p;
+		this->gcAdapter = game.gcAdapter;
 		this->aspectratio = game.aspectratio;
 		this->ScreenMode = game.ScreenMode;
 		this->language = game.language;

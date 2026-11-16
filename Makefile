@@ -38,6 +38,7 @@ SOURCES		:=	source \
 				source/BoxCover \
 				source/GameCube \
 				source/cheats \
+				source/gcadapter \
 				source/homebrewboot \
 				source/themes \
 				source/menu \
@@ -117,6 +118,7 @@ endif
 
 export OFILES	:=	$(addsuffix .o,$(DATAFILES)) \
 					$(CURDIR)/data/magic_patcher.o \
+					gcpad.bin.o \
 					$(CPPFILES:.cpp=.o) $(CFILES:.c=.o) \
 					$(sFILES:.s=.o) $(SFILES:.S=.o)
 
@@ -240,6 +242,18 @@ language: $(wildcard $(PROJECTDIR)/Languages/*.lang) $(wildcard $(PROJECTDIR)/Th
 	$(bin2o)
 	
 %.bnr.o	:	%.bnr
+	@echo $(notdir $<)
+	$(bin2o)
+
+#---------------------------------------------------------------------------------
+# The GameCube adapter blob that goes into games (source/gcadapter/runtime)
+#---------------------------------------------------------------------------------
+GCPAD_BLOB	:=	$(PROJECTDIR)/$(BUILD)/gcpad/gcpad.bin
+
+$(GCPAD_BLOB): $(wildcard $(PROJECTDIR)/source/gcadapter/runtime/*)
+	@$(MAKE) --no-print-directory -C $(PROJECTDIR) -f source/gcadapter/runtime/Makefile OUT=$(BUILD)/gcpad
+
+gcpad.bin.o: $(GCPAD_BLOB)
 	@echo $(notdir $<)
 	$(bin2o)
 

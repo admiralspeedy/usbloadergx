@@ -107,6 +107,7 @@ void CSettings::SetDefault()
 	videopatch = OFF;
 	videoPatchDol = OFF;
 	patchFix480p = ON;
+	gcAdapter = GC_ADAPTER_OFF;
 	deflicker = DEFLICKER_AUTO;
 	videoWidth = WIDTH_AUTO;
 	language = CONSOLE_DEFAULT;
@@ -341,6 +342,7 @@ bool CSettings::Save()
 	fprintf(file, "videopatch = %d\n", videopatch);
 	fprintf(file, "videoPatchDol = %d\n", videoPatchDol);
 	fprintf(file, "patchFix480p = %d\n", patchFix480p);
+	fprintf(file, "gcAdapter = %d\n", gcAdapter);
 	fprintf(file, "deflicker = %d\n", deflicker);
 	fprintf(file, "videowidth = %d\n", videoWidth);
 	fprintf(file, "language = %d\n", language);
@@ -602,6 +604,11 @@ bool CSettings::SetSetting(char *name, char *value)
 	else if (strcmp(name, "patchFix480p") == 0)
 	{
 		patchFix480p = atoi(value);
+		return true;
+	}
+	else if (strcmp(name, "gcAdapter") == 0)
+	{
+		gcAdapter = atoi(value);
 		return true;
 	}
 	else if (strcmp(name, "deflicker") == 0)

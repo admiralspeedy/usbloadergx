@@ -123,6 +123,14 @@ enum
 
 enum
 {
+	GC_ADAPTER_OFF,
+	GC_ADAPTER_ON,     // where it is known to work, and with an adapter plugged in
+	GC_ADAPTER_FORCED, // try anyway
+	GC_ADAPTER_MAX
+};
+
+enum
+{
 	DEFLICKER_AUTO,
 	DEFLICKER_OFF,
 	DEFLICKER_OFF_EXTENDED,

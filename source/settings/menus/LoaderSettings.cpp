@@ -39,6 +39,13 @@
 #include "GameCube/GCGames.h"
 #include "sys.h"
 
+static const char * GCAdapterText[] =
+{
+	trNOOP( "OFF" ),
+	trNOOP( "ON" ),
+	trNOOP( "Forced" )
+};
+
 static const char * OnOffText[] =
 {
 	trNOOP( "OFF" ),
@@ -317,6 +324,7 @@ void LoaderSettings::SetOptionNames()
 	Options->SetName(Idx++, "%s", tr( "Channel Launcher" ));
 	Options->SetName(Idx++, "%s", tr( "Disable Wiimote Motor" ));
 	Options->SetName(Idx++, "%s", tr( "Disable Wiimote Speaker" ));
+	Options->SetName(Idx++, "%s", tr( "GameCube Adapter (Wii U)" ));
 	Options->SetName(Idx++, "%s", tr( "Autoboot Discs" ));
 	Options->SetName(Idx++, "%s", tr( "Autoboot Discs Delay" ));
 	Options->SetName(Idx++, "%s", tr( "=== GameCube Settings" ));
@@ -480,6 +488,9 @@ void LoaderSettings::SetOptionValues()
 
 	//! Settings: Disable Wiimote Speaker
 	Options->SetValue(Idx++, "%s", tr( OnOffText[Settings.wpadSpeaker] ));
+
+	//! Settings: GameCube Adapter (Wii U)
+	Options->SetValue(Idx++, "%s", tr( GCAdapterText[Settings.gcAdapter] ));
 
 	//! Settings: Autoboot Discs
 	Options->SetValue(Idx++, "%s", tr( OnOffText[Settings.AutobootDiscs] ));
@@ -889,6 +900,12 @@ int LoaderSettings::GetMenuInternal()
 	else if (ret == ++Idx )
 	{
 		if (++Settings.wpadSpeaker >= MAX_ON_OFF) Settings.wpadSpeaker = 0;
+	}
+
+	//! Settings: GameCube Adapter (Wii U)
+	else if (ret == ++Idx )
+	{
+		if (++Settings.gcAdapter >= GC_ADAPTER_MAX) Settings.gcAdapter = 0;
 	}
 
 	//! Settings: Autoboot Discs

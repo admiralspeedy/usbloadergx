@@ -44,6 +44,7 @@
 #include "network/Wiinnertag.h"
 #include "patches/patchcode.h"
 #include "patches/gamepatches.h"
+#include "gcadapter/gcadapter.hpp"
 #include "patches/wip.h"
 #include "patches/bca.h"
 #include "banner/OpeningBNR.hpp"
@@ -318,6 +319,7 @@ int GameBooter::BootGame(struct discHdr *gameHdr, const s8 useOcarina)
 	u8 WiirdDebugger = game_cfg->WiirdDebugger == INHERIT ? Settings.WiirdDebugger : game_cfg->WiirdDebugger;
 	u8 disableMotor = game_cfg->wpadMotor == INHERIT ? Settings.wpadMotor : game_cfg->wpadMotor;
 	u8 disableSpeaker = game_cfg->wpadSpeaker == INHERIT ? Settings.wpadSpeaker : game_cfg->wpadSpeaker;
+	u8 gcAdapterChoice = game_cfg->gcAdapter == INHERIT ? Settings.gcAdapter : game_cfg->gcAdapter;
 	u8 ScreenMode = game_cfg->ScreenMode == INHERIT ? Settings.ScreenMode : game_cfg->ScreenMode;
 	u16 videoWidth = game_cfg->videoWidth == INHERIT ? Settings.videoWidth : game_cfg->videoWidth;
 	u64 returnToChoice = strlen(Settings.returnTo) > 0 ? (game_cfg->returnTo ? NandTitles.FindU32(Settings.returnTo) : 0) : 0;
@@ -673,16 +675,47 @@ int GameBooter::BootGame(struct discHdr *gameHdr, const s8 useOcarina)
 	GCGames::DestroyInstance();
 	Channels::DestroyInstance();
 
+	//! GameCube adapter (Wii U): what the cIOS reads the game from, for its hardware checks
+	GCAdapter::LaunchInfo gcAdapterLaunch = {};
+	gcAdapterLaunch.gameIOS = IOS_GetVersion();
+	for (const d2x &cios : d2x_list)
+	{
+		if (cios.slot == gcAdapterLaunch.gameIOS)
+			gcAdapterLaunch.d2xBase = cios.base;
+	}
+	if (gameHeader.tid == 0 && gameHeader.type != TYPE_GAME_WII_DISC)
+	{
+		gcAdapterLaunch.readsFromSD = Settings.SDMode;
+		gcAdapterLaunch.readsFromUSB = !Settings.SDMode;
+	}
+	if (NandEmuMode && strchr(NandEmuPath, '/'))
+	{
+		if (strncmp(NandEmuPath, "usb", 3) == 0)
+			gcAdapterLaunch.readsFromUSB = true;
+		else
+			gcAdapterLaunch.readsFromSD = true;
+	}
+	//! Games that check their own code
+	if (gcAdapterChoice != GC_ADAPTER_OFF && exclude_game(gameHeader.id, false))
+	{
+		gprintf("GameCube adapter: off: the game checks its own code\n");
+		gcAdapterChoice = GC_ADAPTER_OFF;
+	}
+
 	//! Load main.dol or alternative dol into memory, start the game apploader and get game entrypoint
 	if (gameHeader.tid == 0)
 	{
 		gprintf("Game Boot\n");
 		AppEntrypoint = BootPartition(Settings.dolpath, videoChoice, alternatedol, alternatedoloffset, gameHeader);
+		//! Open /dev/usb/hid for the GameCube adapter before libogc's USB lets go of it
+		GCAdapter::OpenUSB(gcAdapterChoice, gcAdapterLaunch);
 		// Reading of game is done we can close devices now
 		ShutDownDevices(usbport);
 	}
 	else
 	{
+		//! Open /dev/usb/hid for the GameCube adapter before libogc's USB lets go of it
+		GCAdapter::OpenUSB(gcAdapterChoice, gcAdapterLaunch);
 		//! shutdown now and avoid later crashes with free if memory gets overwritten by channel
 		ShutDownDevices(DeviceHandler::PartitionToUSBPort(std::max(atoi(NandEmuPath + 3) - 1, 0)));
 		gprintf("Channel Boot\n");
@@ -696,9 +729,13 @@ int GameBooter::BootGame(struct discHdr *gameHdr, const s8 useOcarina)
 	if (AppEntrypoint == 0)
 	{
 		gprintf("AppEntryPoint is 0, something went wrong\n");
+		GCAdapter::Cancel();
 		WDVD_ClosePartition();
 		Sys_BackToLoader();
 	}
+
+	//! Find the game's PAD functions for the GameCube adapter, in its code as loaded (before the patches)
+	GCAdapter::FindFunctions();
 
 	//! Do all the game patches
 	gprintf("Applying game patches...\n");
@@ -765,6 +802,9 @@ int GameBooter::BootGame(struct discHdr *gameHdr, const s8 useOcarina)
 			break;
 		}
 	}
+
+	//! GameCube adapter: the blob below the game's MEM1 arena and the hooks, after every other patch
+	GCAdapter::Install();
 
 	//! Jump to the entrypoint of the game - the last function of the USB Loader
 	gprintf("Jumping to game entrypoint: 0x%08x.\n", AppEntrypoint);

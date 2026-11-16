@@ -1,0 +1,195 @@
+/* SPDX-FileCopyrightText: 2026 RiftWii contributors */
+/* SPDX-FileCopyrightText: 2017 Alex Chadwick (wup-028-bslug) <https://github.com/Chadderz121/wup-028-bslug> */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* The GameCube adapter's in-game blob: PADRead and PADControlMotor
+ * hooked, the WUP-028 driver (runtime/rtgcad.c) behind them. With the
+ * way back (#224), L, R, Z and Start held on a GameCube controller leave
+ * the game through its own OSReturnToMenu: three more hooks, the SDK's IPC
+ * submit routine (save activity), OSSleepThread (where it leaves) and
+ * OSSuspendThread (where a thread that suspends itself to wait leaves). With
+ * the HOME Menu (#224 part 1), the same combo opens the game's HOME Menu
+ * instead where it can: three more hooks, the KPAD read, WPADProbe and
+ * HBMCalc, stand a Classic Controller in on a free channel (rthome.h). Its
+ * own small blob beside the resident runtime, so a game without the
+ * adapter option never carries it and the resident's ABI is untouched.
+ *
+ * SIProbe is hooked too, where found, in both builds (with the HOME Menu
+ * and without): a game that asks it what is in a port before it reads one
+ * hears a controller where the adapter plays (#510, rtsiprobe.h).
+ *
+ * Layout (pad_entry.S): the header below, the two trampolines with
+ * their loader-filled replay slots, the IPC completion entry, the C
+ * code, then the context. Position independent like the resident (the
+ * build links it at two bases and compares). The driver's state (with
+ * every buffer IOS touches) is in MEM2, at ctx->state: a struct gcad_hub,
+ * or the adapter's struct gcad alone with RT_PAD_FLAG_ADAPTER_ONLY. */
+#ifndef RIFTWII_PAD_HOOK_H
+#define RIFTWII_PAD_HOOK_H
+
+#include <stdint.h>
+
+#include "rtgcad.h"
+#include "rthome.h"
+#include "rtleave.h"
+#include "rtrestart.h"
+
+#define RT_PAD_MAGIC 0x52575044u          /* "RWPD" */
+#define RT_PAD_VERSION 7u               /* also in pad_entry.S's header */
+#define RT_PAD_CONTEXT_MAGIC 0x52575043u  /* "RWPC" */
+#define RT_PAD_CONTEXT_BYTES 512u  /* also pad_entry.S's fill */
+/* The context of the blob built without the HOME Menu (RT_PAD_NO_HOME):
+ * everything before home_on, as before #387. */
+#define RT_PAD_CONTEXT_BASE_BYTES 288u  /* also pad_entry.S's fill */
+
+/* rt_pad_context.leave_asked: the combo asked for the way back; an
+ * OSSleepThread has gone into OSReturnToMenu (rtleave_sleep_leaves: the
+ * main thread's, or the pad-reading thread's after the fallback wait). */
+#define RT_PAD_LEAVE_ASKED 1u
+#define RT_PAD_LEAVE_GONE 2u
+
+/* How long the way back waits for the main thread to sleep before it
+ * leaves from the sleep of the thread that read the pads instead. Normal
+ * games sleep their main thread every frame, so they never get this far. */
+#define RT_PAD_LEAVE_FALLBACK_MS 500u
+
+/* rt_pad_context.flags */
+#define RT_PAD_FLAG_DEMO 1u  /* no adapter needed: the first empty port presses A about once a second (Dolphin tests) */
+/* The state is the adapter's alone (struct gcad, not struct gcad_hub):
+ * no other USB pad's mapping was loaded before the launch and no Xbox 360
+ * pad was plugged in, so the four pad links, the catalog and the ven list
+ * could never be used. */
+#define RT_PAD_FLAG_ADAPTER_ONLY 2u
+/* A code build started with Xbox 360 pads only (no adapter, no other USB
+ * pad): the /dev/usb/hid list owner lies dormant, a pad link's size,
+ * asking for no list (#496). */
+#define RT_PAD_FLAG_HID_DORMANT 4u
+
+/* Big-endian words at the start of the blob. */
+struct rt_pad_header {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t size;
+    uint32_t context_offset;
+    uint32_t hook_read;        /* PADRead's trampoline */
+    uint32_t replay_read;      /* 16 bytes: the displaced word, then padding */
+    uint32_t continue_read;    /* 16 bytes: the jump back (replay + 16) */
+    uint32_t hook_motor;       /* PADControlMotor's */
+    uint32_t replay_motor;
+    uint32_t continue_motor;
+    uint32_t complete;         /* the IPC callback */
+    uint32_t hook_submit;      /* the SDK's IPC submit routine's (save activity) */
+    uint32_t replay_submit;
+    uint32_t continue_submit;
+    uint32_t hook_sleep;       /* OSSleepThread's (the way back leaves from a sleep) */
+    uint32_t replay_sleep;
+    uint32_t continue_sleep;
+    uint32_t hook_suspend;     /* OSSuspendThread's (or from a thread suspending itself) */
+    uint32_t replay_suspend;
+    uint32_t continue_suspend;
+    uint32_t hook_restart;     /* OSRestart's (the game's own Reset, #458; not in the code builds' blob) */
+    uint32_t replay_restart;
+    uint32_t continue_restart;
+    uint32_t hook_si_probe;    /* SIProbe's (a filled port answers as a controller, #510) */
+    uint32_t replay_si_probe;
+    uint32_t continue_si_probe;
+    /* The HOME Menu's, last: the blob without it has a header that ends here. */
+    uint32_t hook_kpad;        /* the KPAD read's (the stand-in Classic Controller's status) */
+    uint32_t replay_kpad;
+    uint32_t continue_kpad;
+    uint32_t hook_probe;       /* WPADProbe's (the stand-in's channel answers "Classic Controller") */
+    uint32_t replay_probe;
+    uint32_t continue_probe;
+    uint32_t hook_menu;        /* HBMCalc's (the HOME Menu is open) */
+    uint32_t replay_menu;
+    uint32_t continue_menu;
+    uint32_t hook_select;      /* HBMGetSelectBtnNum's (which button the menu ends on) */
+    uint32_t replay_select;
+    uint32_t continue_select;
+    uint32_t hook_unified;     /* KPADGetUnifiedWpadStatus's (the stand-in's raw status, where the game has it) */
+    uint32_t replay_unified;
+    uint32_t continue_unified;
+};
+
+struct rt_pad_context {
+    uint32_t magic;
+    uint32_t state;            /* struct gcad, in MEM2 */
+    uint32_t ioctl_async;      /* the game's IOS_IoctlAsync (unhooked) */
+    uint32_t ioctlv_async;     /* the game's IOS_IoctlvAsync (unhooked), 0 on v4 */
+    uint32_t complete_entry;   /* this blob's completion entry */
+    int32_t fd;                /* /dev/usb/hid, opened by the loader */
+    uint32_t version;          /* 4 or 5 */
+    uint32_t ticks_per_ms;     /* time base */
+    uint32_t inited;           /* the driver state is set up (first PADRead) */
+    uint32_t overlay_mask;     /* ports the last PADRead filled from the adapter */
+    uint32_t reads;
+    uint32_t replies;
+    uint32_t flags;            /* RT_PAD_FLAG_* (loader-filled) */
+    int32_t known_dev;         /* the adapter's device id from the menu's USB list, -1: none */
+    uint32_t idle_reset;       /* the game's screen-dimming reset for its controller ports, 0: not found */
+    gcad_pad last[GCAD_PORTS]; /* each port as it was when it last counted as in use (gcad_pad_moved) */
+    /* The way back (0 return_to_menu: none). */
+    uint32_t return_to_menu;   /* the game's OSReturnToMenu */
+    struct rtleave leave;      /* the hold and the saves (runtime/rtleave.h; hold and quiet loader-filled) */
+    uint32_t leave_asked;      /* RT_PAD_LEAVE_*: 0, then asked, then gone (once only) */
+    /* Saves on the SD card go through the resident runtime's own card
+     * driver, which the submit hook doesn't read: its rt_fs_state's
+     * last_write (then wrote), 0 without the redirect (loader-filled). */
+    uint32_t resident_last_write;
+    /* And its savegame engine's busy word and queue count: a request in
+     * hand or queued (rtleave_resident). Loader-filled with the above. */
+    uint32_t resident_busy;
+    uint32_t resident_queued;
+    /* The ask: the thread running the PADRead that made it (0x800000E4
+     * then) and when (low bit set), both 0 while none is open. */
+    uint32_t leave_thread;
+    uint32_t leave_asked_at;
+    uint32_t diagnostic_print; /* the installed Wii Remote log's print entry */
+    char diagnostic_format[40]; /* loader-filled marker, decoded at next start */
+    int32_t ven_fd;            /* /dev/usb/ven for Xbox 360 pads, opened by the loader; -1: none */
+    /* The state's layout, without RT_PAD_FLAG_ADAPTER_ONLY: its pad links
+     * (four, or a code build's pads plugged in at the launch), and where
+     * each part starts from the state's start, as the loader worked them
+     * out (gcad_layout_for) so the game doesn't again (#506). Loader-filled. */
+    uint32_t link_count;
+    uint32_t ven_at, xbox_at, links_at, catalog_at;
+    /* The game's own Reset (#458), in a launch with no resident runtime to
+     * take it: a struct rtrestart_block in MEM2 (its state says whether
+     * it is on), 0: the game's Reset is left alone. */
+    uint32_t restart;
+    /* The GameCube controllers' calibrations (rtpadcal.h's table, in MEM2
+     * after the driver's state), 0: none stored. The Wii's own ports take
+     * theirs here, the adapter's and the USB pads' in the driver. */
+    uint32_t cal;
+    /* The HOME Menu (#224 part 1); home_on 0: off, the combo is the way
+     * back. Loader-filled: the KPAD status's size, whether the read takes
+     * the error's address, the game's PADRead (hooked: read again when the
+     * game stops reading its pads while its menu is up), the timings in
+     * home, then home_on once all four hooks are in. */
+    uint32_t home_on;
+    uint32_t kpad_status_bytes;
+    uint32_t kpad_takes_error;
+    uint32_t pad_read;
+    struct rthome home;
+    uint32_t home_buffer;      /* the KPAD buffer the stand-in's status went into last, when the game keeps it (0: on a stack) */
+    uint32_t home_fresh;       /* the KPAD read wrote it since the HOME Menu's last probe */
+    uint32_t home_writes;      /* statuses written in this stand-in's time */
+    uint32_t home_judged;      /* this stand-in's end has been looked at (pad_home_check) */
+    uint32_t last_pad_read;    /* when PADRead last ran (low bit set) */
+    uint8_t pad_scratch[48];   /* PADStatus[4] for that read of our own */
+    /* KPADGetUnifiedWpadStatus's statuses' size (loader-filled), 0: not
+     * hooked. Mario Kart Wii takes a Classic Controller's buttons from
+     * there, not from the KPAD read (9 Nov). */
+    uint32_t kpad_unified_bytes;
+    /* The game's own connect callbacks (KPADSetConnectCallback), channel
+     * c's at kpad_connect + c * (kpad_connect_info & 0xFFFF), 0: none
+     * found (loader-filled). The info word's bits 16-23 hold the channel
+     * the game was last told is connected, plus one (0: none). */
+    uint32_t kpad_connect;
+    uint32_t kpad_connect_info;
+};
+
+#ifdef RT_TARGET_PPC
+typedef char rt_pad_context_layout[(sizeof(struct rt_pad_context) <= RT_PAD_CONTEXT_BYTES) ? 1 : -1];
+#endif
+
+#endif

@@ -1,0 +1,498 @@
+/* SPDX-FileCopyrightText: 2026 RiftWii contributors */
+/* SPDX-FileCopyrightText: 2017 Alex Chadwick (wup-028-bslug) <https://github.com/Chadderz121/wup-028-bslug> */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* The GameCube controller adapter for Wii U (WUP-028) through IOS's
+ * /dev/usb/hid: one driver for the in-game runtime (runtime/pad), the
+ * menu's test page (wii/controllers/gcadapter.cpp) and the host tests.
+ *
+ * It is a state machine driven by IPC replies: every request goes out
+ * asynchronously through the environment (gcad_env_*, supplied by each
+ * user), and its reply comes back to gcad_on_reply. Nothing blocks, so
+ * the game's PADRead can drive it and IOS's replies can arrive in its
+ * IPC interrupt. Freestanding: no libc, no constant data, no division.
+ *
+ * Sources (no code taken from any of them):
+ *  - wiibrew, "/dev/usb/hid (v4)", "/dev/usb/hid (v5)", "/dev/usb/ven":
+ *    ioctl numbers, buffer sizes, the device lists, handles (the open
+ *    mode picks one of 16 in v5), SuspendResume/GetDeviceInfo before any
+ *    transfer, the v5 interrupt direction word at offset 8, -7022 on
+ *    unplug, the manager locked to a handle until AttachFinish.
+ *  - Dolphin's IOS HID v4/v5 emulation: exact sizes it checks (0x600,
+ *    0x180, 0x20, 0x60), the v4 device entry layout.
+ *  - Dolphin's GCAdapter.cpp and wup-028-bslug (MIT, Alex Chadwick 2017):
+ *    the adapter's init (0x13) and rumble (0x11) commands, the 37-byte
+ *    report starting 0x21, 9 bytes per port, wired/wireless bits 4/5,
+ *    the button bits; rumble sent between polls.
+ *  - fakemote (embedded-game-controller): Attach, resume and read the
+ *    descriptors before AttachFinish; other handles (fakemote uses 15,
+ *    libogc 0) may own a device for a while and release it later.
+ *  - Dolphin's IOS /dev/usb/ven emulation, for wired Xbox 360 pads (a
+ *    vendor-class interface, which /dev/usb/hid does not list): its
+ *    GetDeviceInfo reply of 0xC0 bytes (interface descriptor at 52,
+ *    endpoints from 64, 8 bytes each), the interrupt endpoint as a byte
+ *    at 14 of the message, the cancel's endpoint at 8.
+ *  - The Xbox 360 pad's public protocol notes (free60, the class triple
+ *    0xFF/0x5D/0x01): the 20-byte report, the LED and rumble output
+ *    messages. No driver's code was used.
+ *  - For the wired Switch Pro Controller (057E:2009): dekuNukem's
+ *    Nintendo_Switch_Reverse_Engineering notes (USB-HID-Notes.md: the
+ *    80 01, 80 02 and 80 04 messages and their 81 answers, 80 02 answered
+ *    once per power-on, 01 carrying a subcommand; bluetooth_hid_notes.md:
+ *    the 0x30 report, its button bytes and 12-bit sticks, subcommand 03
+ *    picking it), HIDtoVPAD's controller_patcher (the same start-up on
+ *    the Wii U, an answer read after each message; its USB button bits),
+ *    Linux's hid-nintendo (the stick reach used when a pad's calibration
+ *    can't be read, subcommand 03 after the USB start-up) and SDL's
+ *    Switch driver (the start-up order, 80 04 sent without waiting for an
+ *    answer, a message sent again when unanswered). All read as
+ *    documentation; no code was taken from any of them.
+ */
+#ifndef RIFTWII_RTGCAD_H
+#define RIFTWII_RTGCAD_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include "rthid.h"
+#include "rtpadcal.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define GCAD_VID_PID 0x057E0337u  /* Nintendo WUP-028 */
+/* No device. Only -1: Dolphin numbers /dev/usb/ven's devices from
+ * 0xE71F0021 up, negative as an int32_t (an Xbox 360 pad was skipped). */
+#define GCAD_NO_DEVICE (-1)
+#define GCAD_PORTS 4u
+#define GCAD_REPORT_BYTES 37u
+#define GCAD_TIMEOUT_MS 1500u     /* no report for this long: every port reads as unplugged */
+#define GCAD_RELINK_MS 1000u      /* a failed link is tried again after this */
+#define GCAD_RESCAN_MS 2000u      /* a device another handle owns, or a failed device list */
+#define GCAD_RECAL_MS 3000u       /* X+Y+Start held this long takes a new origin, like the pad */
+#define GCAD_ACTIVE_STEP 10       /* a stick or trigger moving this far between reads is a player (gcad_pad_moved) */
+#define GCAD_ORIGIN_SPREAD 32     /* a stick at rest reads within this of the middle (128) */
+#define GCAD_ORIGIN_STEADY_READS 3 /* readings at rest in a row, each close to the last, before one is the origin */
+#define GCAD_ORIGIN_STEADY_STEP 3 /* how close: no axis further than this from the reading before */
+#define GCAD_ORIGIN_TRIGGER_MAX 80 /* a trigger at rest reads no more than this */
+#define GCAD_ORIGIN_WAIT_MS 500u  /* no reading at rest this long: the axes still off take the middle */
+#define GCAD_CTRL_MS 100u         /* SET_PROTOCOL unanswered this long: init anyway */
+#define GCAD_SWITCH_ANSWER_MS 1000u /* a Switch Pro start-up message's answer is waited for this long */
+#define GCAD_SETTLE_MS 500u       /* v5: a newly listed adapter is set up this long after the change */
+
+/* /dev/usb/hid ioctls. */
+#define GCAD_V4_GET_DEVICE_CHANGE 0u
+#define GCAD_V4_CONTROL 2u
+#define GCAD_V4_INTERRUPT_IN 3u
+#define GCAD_V4_INTERRUPT_OUT 4u
+#define GCAD_V4_GET_VERSION 6u
+#define GCAD_V4_SHUTDOWN 7u
+#define GCAD_V4_CANCEL_INTERRUPT 8u
+#define GCAD_V5_GET_VERSION 0u
+#define GCAD_V5_GET_DEVICE_CHANGE 1u
+#define GCAD_V5_SHUTDOWN 2u
+#define GCAD_V5_GET_DEVICE_INFO 3u
+#define GCAD_V5_ATTACH 4u
+#define GCAD_V5_RELEASE 5u
+#define GCAD_V5_ATTACH_FINISH 6u
+#define GCAD_V5_SUSPEND_RESUME 16u
+#define GCAD_V5_CANCEL_ENDPOINT 17u
+#define GCAD_V5_CONTROL 18u
+#define GCAD_V5_INTERRUPT 19u
+#define GCAD_V4_VERSION 0x00040001u
+#define GCAD_V5_VERSION 0x00050001u
+
+/* Request slots: each has at most one request in flight. */
+#define GCAD_TAG_CHANGE 1u   /* device list, then (v5) AttachFinish */
+#define GCAD_TAG_SETUP 2u    /* v5: Attach, SuspendResume, GetDeviceInfo */
+#define GCAD_TAG_IN 3u       /* the report poll */
+#define GCAD_TAG_OUT 4u      /* init, then rumble */
+#define GCAD_TAG_STOP 5u     /* gcad_stop's cancels, and a Switch Pro's stuck start-up */
+#define GCAD_TAGS 6u
+#define GCAD_HID_PADS 4u
+#define GCAD_VEN_SLOT (GCAD_HID_PADS + 1u) /* the /dev/usb/ven list's requests */
+#define GCAD_INSTANCES (2u + GCAD_HID_PADS)
+#define GCAD_REQUESTS (GCAD_TAGS * GCAD_INSTANCES)
+#define GCAD_SLOT(tag) ((uint32_t)(tag) >> 28)
+#define GCAD_REQUEST_SLOT(tag) (GCAD_SLOT(tag) * GCAD_TAGS + ((tag) & 15u))
+
+/* Link states. */
+#define GCAD_LINK_NONE 0u    /* no adapter listed */
+#define GCAD_LINK_SETUP 1u   /* v5 setup in flight */
+#define GCAD_LINK_INIT 2u    /* init command in flight */
+#define GCAD_LINK_POLL 3u    /* reports flowing */
+#define GCAD_LINK_FAILED 4u  /* waiting to try again */
+#define GCAD_LINK_BUSY 5u    /* v5: another handle owns it for now */
+#define GCAD_LINK_CTRL 6u    /* SET_PROTOCOL in flight, init next */
+#define GCAD_LINK_SETTLE 7u  /* v5: listed just now, set up after GCAD_SETTLE_MS */
+
+/* Event codes for gcad_env_event (the test page's log). */
+#define GCAD_EV_REPLY 1u     /* a = tag | step << 8, b = result */
+#define GCAD_EV_SUBMIT_FAIL 2u /* a = tag | step << 8, b = result */
+#define GCAD_EV_DEVICE 3u    /* a = device id, b = vid << 16 | pid (each listed device) */
+#define GCAD_EV_FOUND 4u     /* a = device id */
+#define GCAD_EV_LOST 5u      /* a = device id */
+#define GCAD_EV_LINKED 6u    /* a = device id: reports flowing */
+#define GCAD_EV_PORT 7u      /* a = port, b = status byte (connected or not) */
+#define GCAD_EV_BAD_REPORT 8u /* a = first byte, b = result */
+#define GCAD_EV_FIRST_REPORT 9u /* a = device id, b = the four ports' status bytes, port 1 highest */
+#define GCAD_EV_ORIGIN 10u   /* a = port | how << 8 | L << 16 | R << 24, b = stick x, y, substick x, y (x highest) */
+
+/* How a port's origin was taken (GCAD_EV_ORIGIN). */
+#define GCAD_EV_HID_FOUND 11u /* a = VID/PID, b = device id */
+#define GCAD_EV_HID_MISSING 12u /* a = VID/PID: no mapping, never claimed */
+#define GCAD_EV_HID_LOST 13u /* a = VID/PID */
+#define GCAD_EV_HID_PORT 14u /* a = VID/PID, b = game port (zero based) */
+#define GCAD_EV_HID_DIAG 15u /* a = diagnostic step | detail << 8, b = IOS result */
+#define GCAD_EV_HID_LIST 16u /* discovery diagnostic for the configured catalog */
+
+#define GCAD_HID_RESUME 0u
+#define GCAD_HID_INFO 1u
+#define GCAD_HID_DESCRIPTORS 2u
+#define GCAD_HID_WAKE 3u
+#define GCAD_HID_OUTPUT 4u
+#define GCAD_HID_POLL 5u
+#define GCAD_HID_INPUT 6u
+#define GCAD_HID_SILENT 7u
+#define GCAD_HID_SHORT 8u
+#define GCAD_HID_TIMEOUT 9u
+#define GCAD_HID_BLOCKED 10u
+#define GCAD_HID_LED 11u
+#define GCAD_HID_POLL_ERROR 12u
+#define GCAD_HID_RUMBLE 13u
+#define GCAD_HID_INTERFACE 14u /* detail: interface number, result: class */
+#define GCAD_HID_DISCOVERY 15u /* detail: 0 queued, 1 replied; result: IOS result */
+/* Switch Pro start-up done; detail: answers seen (1 status, 2 handshake,
+ * 4 high speed, 8 handshake again), and << 4 the handshakes sent twice. */
+#define GCAD_HID_SWITCH 16u
+/* What one Switch Pro start-up read brought; detail: the 80 xx message
+ * sent last (0 for the full-report subcommand), the read's length (255
+ * at most) << 8, its fifth byte << 16; result: its first four bytes. */
+#define GCAD_HID_SWITCH_READ 17u
+#define GCAD_HID_DIAGS 18u
+
+#define GCAD_ORIGIN_RESTING 0u /* from a reading of the pad at rest */
+#define GCAD_ORIGIN_MIDDLE 1u  /* nothing steady at rest for GCAD_ORIGIN_WAIT_MS: the axes not settled took the middle */
+#define GCAD_ORIGIN_RECAL 2u   /* X+Y+Start held */
+#define GCAD_ORIGIN_PASSED 3u  /* not taken: the pad's first reading was not at rest (the values are that reading) */
+
+/* Steps inside the slots, for the log. */
+#define GCAD_STEP_CHANGE 0u
+#define GCAD_STEP_FINISH 1u
+#define GCAD_STEP_CTRL 2u    /* SET_PROTOCOL */
+#define GCAD_STEP_RESUME 3u
+#define GCAD_STEP_INFO 4u
+#define GCAD_STEP_INIT 5u
+#define GCAD_STEP_RUMBLE 6u
+#define GCAD_STEP_POLL 7u
+#define GCAD_STEP_CANCEL 8u
+
+/* One port as the SDK's PADStatus would carry it, relative to the
+ * origin taken when the controller appeared (as PADRead reports it). */
+typedef struct gcad_pad {
+    uint16_t buttons;          /* PAD_BUTTON_* bits */
+    int8_t stick_x, stick_y, substick_x, substick_y;
+    uint8_t trigger_l, trigger_r;
+    uint8_t wireless;          /* a WaveBird receiver: no rumble */
+} gcad_pad;
+
+typedef struct gcad_descriptor {
+    uint16_t packet_bytes;
+    uint8_t endpoint_in, endpoint_out, interface_number;
+    uint8_t interface_class, interface_seen;
+    uint8_t interface_subclass, interface_protocol;
+} gcad_descriptor;
+
+/* A wired Xbox 360 pad's gamepad interface (the headset and security
+ * interfaces of the same pad have other subclasses or protocols). */
+#define GCAD_XBOX_CLASS 0xFFu
+#define GCAD_XBOX_SUBCLASS 0x5Du
+#define GCAD_XBOX_PROTOCOL 0x01u
+#define GCAD_XBOX_REPORT_BYTES 14u /* type, length, buttons, triggers, sticks */
+#define GCAD_XBOX_RUMBLE_BYTES 8u  /* one 8-byte motor message */
+/* An adapter port's status byte: the gray plug is in (rumble power). */
+#define GCAD_STATUS_RUMBLE_POWER 0x04u
+/* The driver's own layout for a wired Xbox 360 pad (no config file),
+ * with room for its rumble messages: 96 bytes, 396 before #506. */
+typedef struct gcad_xbox_layout {
+    rthid_layout layout;
+    uint8_t rumble[2 * GCAD_XBOX_RUMBLE_BYTES];
+} gcad_xbox_layout;
+#define GCAD_VEN_INFO_BYTES 0xC0u
+
+/* The wired Switch Pro Controller: a HID pad, but one that sends nothing
+ * until a start-up exchange no controller.ini can describe, and whose
+ * sticks are packed 12-bit values. Built in, like the Xbox 360 pad. */
+#define GCAD_SWITCH_VID_PID 0x057E2009u
+#define GCAD_PS3_VID_PID 0x054C0268u /* a DualShock 3: its feature-report wake-up */
+#define GCAD_SWITCH_REPORT_BYTES 12u /* id, timer, battery, 3 button bytes, 2 sticks of 3 bytes */
+
+/* SDK PAD button bits. */
+#define GCAD_PAD_LEFT 0x0001u
+#define GCAD_PAD_RIGHT 0x0002u
+#define GCAD_PAD_DOWN 0x0004u
+#define GCAD_PAD_UP 0x0008u
+#define GCAD_PAD_Z 0x0010u
+#define GCAD_PAD_R 0x0020u
+#define GCAD_PAD_L 0x0040u
+#define GCAD_PAD_A 0x0100u
+#define GCAD_PAD_B 0x0200u
+#define GCAD_PAD_X 0x0400u
+#define GCAD_PAD_Y 0x0800u
+#define GCAD_PAD_START 0x1000u
+
+/* All state. The buffers IOS reads and writes come first: the whole
+ * struct must sit in MEM2, 32-byte aligned (wiibrew: every /dev/usb
+ * buffer is in MEM2 and aligned). Each buffer is a whole number of cache
+ * lines so flushing one never touches another. */
+typedef struct gcad {
+    uint8_t setup_in[0x20];
+    uint8_t setup_out[GCAD_VEN_INFO_BYTES]; /* device info: hid's is 0x60 bytes, ven's 0xC0 */
+    uint8_t in_msg[0x40];      /* v4 request (32 bytes) or v5 message (64) */
+    uint8_t in_data[RTHID_REPORT_MAX]; /* adapter or configurable pad report */
+    uint8_t out_msg[0x40];
+    uint8_t out_data[RTHID_RUMBLE_MAX]; /* init or one configured rumble transfer */
+    uint8_t stop_msg[0x20];    /* gcad_stop's cancel argument */
+    uint8_t env[0x40];         /* the environment's own (ioctlv vectors) */
+
+    void* env_ctx;             /* the environment's context */
+    int32_t fd;
+    uint32_t version;          /* 4 or 5 */
+    uint32_t ticks_per_ms;
+    uint32_t generation;       /* bumped whenever the link is dropped */
+    uint32_t busy;             /* bit per tag: a request in flight */
+    uint8_t started, stopping, change_step, setup_step;
+    uint8_t finish_pending;    /* v5: AttachFinish owed once setup ends */
+    uint8_t change_failed, link, stale;
+    int32_t dev_id;            /* -1: none */
+    uint32_t change_time, link_time, data_time;
+
+    /* The latest report, per port. */
+    uint8_t raw[GCAD_PORTS][9];
+    uint8_t origin[GCAD_PORTS][6]; /* stick x, y, substick x, y, L, R */
+    uint8_t origin_valid[GCAD_PORTS];
+    uint8_t recal_active[GCAD_PORTS];
+    uint32_t origin_since[GCAD_PORTS];  /* when the wait for a reading at rest began */
+    uint8_t steady[GCAD_PORTS][6];      /* the last reading at rest, while the origin waits */
+    uint8_t steady_reads[GCAD_PORTS][6]; /* per axis: readings at rest in a row, each close to the one before */
+    uint32_t recal_since[GCAD_PORTS];
+
+    /* Rumble: what the game wants and what the adapter last took. */
+    uint8_t rumble_want[GCAD_PORTS];
+    uint8_t rumble_sent[GCAD_PORTS];
+    uint8_t rumble_flight[GCAD_PORTS];
+
+    /* Counters for the logs. */
+    uint32_t reports, bad_reports, errors, changes, links;
+    int32_t last_error;
+    uint32_t last_error_step;
+    int32_t ctrl_result, resume_result, info_result, init_result;
+    uint32_t listed;           /* devices in the last list */
+    /* The adapter owns the one device list and AttachFinish sequence.
+     * Pad links reuse its fd and state machine, with distinct IPC tags. */
+    struct gcad* owner;        /* null for the adapter/list owner */
+    struct gcad* peers;        /* the pad links, null without HID support */
+    uint16_t peer_stride;      /* bytes from one pad link to the next */
+    uint8_t peer_count;        /* up to GCAD_HID_PADS */
+    const rthid_catalog* catalog;
+    const rthid_layout* mapping; /* non-null only for a configured pad */
+    /* The calibrations a game applies to the adapter's ports and the USB
+     * pads (rtpadcal.h), read on the list owner only; null in the menu,
+     * whose test pages show what the controllers really send. The
+     * environment sets it after initialization, which zeroes it. */
+    const rtpadcal_table* cal;
+    uint32_t slot;             /* callback routing: 0 adapter, 1..4 pads */
+    uint16_t input_bytes;
+    uint8_t endpoint_in, endpoint_out, interface_number;
+    uint8_t rumble_index;
+    uint8_t port_source[GCAD_PORTS]; /* 0..3 adapter, 4..7 HID, 255 none */
+    uint8_t announced_port;
+    uint8_t adapter_disabled;
+    uint8_t ps3_led;
+    uint8_t output_step;
+    /* Switch Pro start-up: the message sent last (SWITCH_* in rtgcad.c),
+     * input reports read since it went, the answers seen and the messages
+     * sent twice (a bit per step each), and the reads logged since it was
+     * plugged in. */
+    uint8_t switch_step, switch_reads, switch_answers, switch_retried, switch_logs;
+    uint32_t diagnostic_seen;
+    uint32_t diagnostic_detail[GCAD_HID_DIAGS];
+    int32_t diagnostic_result[GCAD_HID_DIAGS];
+    gcad_pad hid_pad;
+    /* The device list's discovery records, asked (0) and answered (1):
+     * one per new result, so retries every GCAD_RESCAN_MS cannot fill a
+     * game's trace queue while its writes stall. */
+    uint8_t discovery_seen;
+    int32_t discovery_result[2];
+    /* /dev/usb/ven, for Xbox 360 pads. On the /dev/usb/hid list owner,
+     * ven_list is the second list owner (null without one). On that one,
+     * `ven` is set and `xbox` holds a built-in mapping per pad link. On a
+     * pad link, `ven` says its device came from the ven list, whose fd it
+     * then uses; `owner` stays the /dev/usb/hid list owner either way. */
+    struct gcad* ven_list;
+    gcad_xbox_layout* xbox;
+    uint8_t ven;
+    uint8_t led_port;          /* Xbox 360: the port its ring shows, 255: none yet */
+    /* Only a list owner's (the adapter's, the ven list's) from here on:
+     * a pad link is GCAD_LINK_BYTES long and never reaches them; an
+     * owner stops after its version's list (GCAD_OWNER_BYTES). */
+    uint32_t ignored_count;
+    int32_t ignored[RTHID_DEVICE_MAX]; /* log an unconfigured device once per plug */
+    uint32_t excluded_count;
+    int32_t excluded[RTHID_DEVICE_MAX]; /* non-HID interfaces, until unplugged */
+    uint32_t device_count;
+    rthid_device devices[RTHID_DEVICE_MAX];
+    gcad_descriptor descriptors[RTHID_DEVICE_MAX]; /* v4 list snapshot */
+    uint8_t change[0x600] __attribute__((aligned(32))); /* device list: v4 fills 0x600, v5 0x180; last */
+} __attribute__((aligned(32))) gcad;
+
+/* Loader-filled catalog survives initialization; everything else is
+ * initialized in place. This entire object must be in aligned MEM2. */
+typedef struct gcad_hub {
+    gcad adapter;
+    gcad pads[GCAD_HID_PADS];
+    rthid_catalog catalog;
+    gcad ven;                  /* /dev/usb/ven's list (gcad_ven_init) */
+    gcad_xbox_layout xbox[GCAD_HID_PADS];
+} gcad_hub;
+
+/* A pad link's bytes: the part before the list owner's fields. */
+#define GCAD_LINK_BYTES ((uint32_t)((offsetof(gcad, ignored_count) + 31u) & ~31u))
+/* A list owner's bytes: up to the end of its version's device list. */
+#define GCAD_OWNER_BYTES(version) \
+    ((uint32_t)((offsetof(gcad, change) + ((version) == 4 ? 0x600u : 0x180u) + 31u) & ~31u))
+
+/* A Wii game's state, sized to what was plugged in at the launch: the
+ * adapter (the /dev/usb/hid list owner), the ven list and an Xbox 360
+ * mapping per link when Xbox 360 pads are in play, `links` pad links,
+ * and the catalog with `maps` mappings. Offsets from the state's start. */
+typedef struct gcad_layout {
+    uint32_t ven, xbox, links, catalog, bytes;
+} gcad_layout;
+
+static inline uint32_t gcad_align32(uint32_t n) { return (n + 31u) & ~31u; }
+
+/* `owner`: the /dev/usb/hid owner's bytes (GCAD_OWNER_BYTES, or
+ * GCAD_LINK_BYTES when it lies dormant: no adapter or HID pad plugged in). */
+static inline void gcad_layout_for(gcad_layout* l, uint32_t owner, uint32_t links, int ven, uint32_t layout_bytes) {
+    uint32_t at = gcad_align32(owner);
+    l->ven = ven ? at : 0;
+    if (ven) at += GCAD_OWNER_BYTES(5);
+    l->xbox = ven ? at : 0;
+    if (ven) at += gcad_align32(links * (uint32_t)sizeof(gcad_xbox_layout));
+    l->links = at;
+    at += links * GCAD_LINK_BYTES;
+    l->catalog = at;
+    at += gcad_align32((uint32_t)offsetof(rthid_catalog, layouts) + layout_bytes);
+    l->bytes = at;
+}
+
+/* The environment. Each returns what IOS_IoctlAsync / IOS_IoctlvAsync
+ * returned (0 when queued); the reply must reach gcad_on_reply with the
+ * same `tag` value. For the ioctlv, `msg` is the first vector (in) and
+ * `data` the second: in when `data_in`, else io. */
+int32_t gcad_env_ioctl(gcad* g, uint32_t tag, uint32_t cmd, void* in, uint32_t in_len, void* out,
+                       uint32_t out_len);
+int32_t gcad_env_ioctlv(gcad* g, uint32_t tag, uint32_t cmd, void* msg, uint32_t msg_len, void* data,
+                        uint32_t data_len, int data_in);
+/* The address IOS takes for a pointer inside a v4 request (virtual). */
+uint32_t gcad_env_address(gcad* g, void* p);
+/* Cache maintenance around a buffer IOS reaches only through that
+ * pointer (the SDK's IPC layer handles the ones passed directly). */
+void gcad_env_flush(gcad* g, void* p, uint32_t len);
+void gcad_env_invalidate(gcad* g, void* p, uint32_t len);
+/* For the logs; may do nothing. */
+void gcad_env_event(gcad* g, uint32_t code, uint32_t a, int32_t b);
+
+/* Zeroes the state. `version` is what GetVersion answered (4 or 5). */
+void gcad_init(gcad* g, void* env_ctx, int32_t fd, uint32_t version, uint32_t ticks_per_ms);
+/* The same for a state `bytes` long (GCAD_OWNER_BYTES or GCAD_LINK_BYTES). */
+void gcad_init_bytes(gcad* g, uint32_t bytes, void* env_ctx, int32_t fd, uint32_t version, uint32_t ticks_per_ms);
+void gcad_hub_init(gcad_hub* hub, void* env_ctx, int32_t fd, uint32_t version, uint32_t ticks_per_ms);
+/* `count` pad links, `stride` bytes apart: sizeof(gcad) in a gcad_hub,
+ * GCAD_LINK_BYTES in a game's own layout (gcad_layout). */
+void gcad_links_init(gcad* adapter, gcad* pads, uint32_t count, uint32_t stride, rthid_catalog* catalog,
+                     void* env_ctx, int32_t fd, uint32_t version, uint32_t ticks_per_ms);
+/* gcad_links_init for an owner `owner_bytes` long (GCAD_OWNER_BYTES, or
+ * GCAD_LINK_BYTES when `dormant`: it asks for no list of its own, as a
+ * code build started with no adapter and no HID pad, #496). */
+void gcad_links_init_ex(gcad* adapter, uint32_t owner_bytes, int dormant, gcad* pads, uint32_t count,
+                        uint32_t stride, rthid_catalog* catalog, void* env_ctx, int32_t fd, uint32_t version,
+                        uint32_t ticks_per_ms);
+/* Adds /dev/usb/ven's device list, for wired Xbox 360 pads, on its own
+ * handle `fd` (v5 only), after gcad_links_init on the same adapter. Its
+ * pads take the same links as the configured HID pads; `xbox` holds one
+ * built-in mapping per link. */
+void gcad_ven_init(gcad* adapter, gcad* ven, gcad_xbox_layout* xbox, void* env_ctx, int32_t fd,
+                   uint32_t ticks_per_ms);
+/* The same with the ven list's state `ven_bytes` long (GCAD_OWNER_BYTES(5)). */
+void gcad_ven_init_ex(gcad* adapter, gcad* ven, uint32_t ven_bytes, gcad_xbox_layout* xbox, void* env_ctx,
+                      int32_t fd, uint32_t ticks_per_ms);
+/* 1 for a vendor whose wired pads speak the Xbox 360 protocol: only
+ * their devices on the ven list are asked for their interface, so a USB
+ * drive or another vendor's device on that list is never touched. */
+int gcad_xbox_vendor(uint32_t vid);
+/* An Xbox 360 report as a GameCube pad: 1 when `report` was one. */
+int gcad_xbox_decode(const uint8_t* report, uint32_t bytes, gcad_pad* out);
+/* The built-in mapping the menu puts in the catalog for a wired Switch
+ * Pro Controller. Only its IDs and report length are used: a pad link
+ * with these IDs runs the start-up and reads reports with
+ * gcad_switch_decode. */
+void gcad_switch_mapping(rthid_mapping* m);
+/* A Switch Pro input report's sticks (left x, y, right x, y), each the top
+ * 8 bits of its 12-bit value, up positive: 1 when `report` is an input
+ * report (0x30, or 0x21, a subcommand's answer, which starts the same). */
+int gcad_switch_sticks(const uint8_t* report, uint32_t bytes, uint8_t sticks[4]);
+/* A Switch Pro input report as a GameCube pad, its sticks measured from
+ * `origin` (sticks at rest, as gcad_switch_sticks gives them): 1 when
+ * `report` was one. */
+int gcad_switch_decode(const uint8_t* report, uint32_t bytes, const uint8_t origin[4], gcad_pad* out);
+/* Menu thread only: new configs have been compiled since the last list.
+ * Reconsiders that list without issuing another IOS device-change call. */
+void gcad_refresh_hid(gcad* adapter, uint32_t now);
+/* The adapter's device id when the loader already knows it: v5 hands
+ * its device list out once per change, to whoever asks first, and the
+ * menu's USB had it; the list request still goes out, for later changes.
+ * Call it right after gcad_init. */
+void gcad_expect(gcad* g, int32_t dev_id);
+/* Starts the first device list, retries what failed, notices silence.
+ * Call it often (every PADRead). `now` is a free-running tick count. */
+void gcad_tick(gcad* g, uint32_t now);
+/* A reply. `tag` is the value handed to the environment. */
+void gcad_on_reply(gcad* g, uint32_t tag, int32_t result, uint32_t now);
+/* 1 and the port's state when a controller is plugged into it and the
+ * adapter is reporting, else 0. */
+int gcad_port(gcad* g, uint32_t port, gcad_pad* out, uint32_t now);
+/* Console ports in `taken` keep priority. Adapter pads fill first (their
+ * own number if free, otherwise first free), then one HID pad per port.
+ * Saves the routing used by gcad_rumble. Returns the ports filled. */
+uint32_t gcad_read_ports(gcad* g, uint32_t taken, gcad_pad out[GCAD_PORTS], uint32_t now);
+/* PADControlMotor's command for a port: 1 rumbles, 0 and 2 stop. */
+void gcad_rumble(gcad* g, uint32_t port, uint32_t command);
+/* Stops for good: cancels what is in flight (Shutdown for the device
+ * list, the endpoints' transfers) and sends nothing more. Done when
+ * gcad_idle is 1; then v5 releases the device and the handle may close. */
+void gcad_stop(gcad* g, uint32_t now);
+int gcad_idle(const gcad* g);
+/* v5: gives the device back (after gcad_stop is idle). */
+void gcad_release(gcad* g);
+
+/* Pure helpers (the host tests use them too). */
+uint32_t gcad_get32(const uint8_t* p);
+void gcad_put32(uint8_t* p, uint32_t v);
+/* The adapter in a v4 list: its device id, or -1. */
+int32_t gcad_find_v4(const uint8_t* list, uint32_t list_bytes);
+/* The adapter in a v5 list of `count` entries: its device id, or -1. */
+int32_t gcad_find_v5(const uint8_t* list, uint32_t count);
+/* A report's port: 1 and `out` when a controller is plugged in. */
+int gcad_decode(const uint8_t raw[9], const uint8_t origin[6], gcad_pad* out);
+/* 1 when `now` differs from `before` the way the SDK's PADRead counts a
+ * pad in a console port as in use, which keeps the screen from dimming:
+ * a button changed, or a stick or trigger moved GCAD_ACTIVE_STEP or more.
+ * A resting stick's wobble of a few steps is not a player. */
+int gcad_pad_moved(const gcad_pad* before, const gcad_pad* now);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

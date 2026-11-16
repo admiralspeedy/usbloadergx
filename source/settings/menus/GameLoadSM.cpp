@@ -36,6 +36,13 @@
 #include "GameLoadSM.hpp"
 #include "sys.h"
 
+static const char * GCAdapterText[] =
+{
+	trNOOP( "OFF" ),
+	trNOOP( "ON" ),
+	trNOOP( "Forced" )
+};
+
 static const char * OnOffText[] =
 {
 	trNOOP( "OFF" ),
@@ -269,6 +276,7 @@ void GameLoadSM::SetOptionNames()
 	Options->SetName(Idx++, "%s", tr( "Wiird Debugger" ));
 	Options->SetName(Idx++, "%s", tr( "Disable Wiimote Motor" ));
 	Options->SetName(Idx++, "%s", tr( "Disable Wiimote Speaker" ));
+	Options->SetName(Idx++, "%s", tr( "GameCube Adapter (Wii U)" ));
 	//! Only on Wii games
 	if (Header->type == TYPE_GAME_WII_IMG || Header->type == TYPE_GAME_WII_DISC)
 	{
@@ -461,6 +469,12 @@ void GameLoadSM::SetOptionValues()
 		Options->SetValue(Idx++, tr("Use global"));
 	else
 		Options->SetValue(Idx++, "%s", tr( OnOffText[GameConfig.wpadSpeaker] ));
+
+	//! Settings: GameCube Adapter (Wii U)
+	if (GameConfig.gcAdapter == INHERIT)
+		Options->SetValue(Idx++, tr("Use global"));
+	else
+		Options->SetValue(Idx++, "%s", tr( GCAdapterText[GameConfig.gcAdapter] ));
 
 	//! Only on Wii games
 	if (Header->type == TYPE_GAME_WII_IMG || Header->type == TYPE_GAME_WII_DISC)
@@ -752,6 +766,12 @@ int GameLoadSM::GetMenuInternal()
 	if (ret == ++Idx)
 	{
 		if (++GameConfig.wpadSpeaker >= MAX_ON_OFF) GameConfig.wpadSpeaker = INHERIT;
+	}
+
+	//! Settings: GameCube Adapter (Wii U)
+	if (ret == ++Idx)
+	{
+		if (++GameConfig.gcAdapter >= GC_ADAPTER_MAX) GameConfig.gcAdapter = INHERIT;
 	}
 
 	//! Only on Wii games
